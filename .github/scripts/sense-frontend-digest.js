@@ -118,9 +118,39 @@ async function fetchMergedPRs() {
     } catch {
       pr.fileSummary = '';
     }
+    // Extract screenshots from the PR body so the digest can show them inline.
+    // GitHub renders uploaded images as markdown ![caption](url) or bare <img>
+    // pointing at user-attachments/assets. We keep caption + url; the emailer
+    // downloads (auth'd) and inlines them via CID.
+    pr.screenshots = extractScreenshots(pr.body);
   }
 
   return merged;
+}
+
+// Pull image references out of a PR body. Returns [{ caption, url }].
+// Only user-attachments/assets URLs (GitHub-hosted uploads) are kept, since
+// those are the ones the emailer can fetch with the repo token.
+function extractScreenshots(body) {
+  if (!body) return [];
+  const out = [];
+  const seen = new Set();
+  const mdRe = /!\[([^\]]*)\]\((https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9-]+)\)/g;
+  const imgRe = /<img\b[^>]*\bsrc="(https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9-]+)"[^>]*>/gi;
+  const altRe = /\balt="([^"]*)"/i;
+  let m;
+  while ((m = mdRe.exec(body))) {
+    if (seen.has(m[2])) continue;
+    seen.add(m[2]);
+    out.push({ caption: (m[1] || '').trim(), url: m[2] });
+  }
+  while ((m = imgRe.exec(body))) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    const alt = altRe.exec(m[0]);
+    out.push({ caption: alt ? alt[1].trim() : '', url: m[1] });
+  }
+  return out;
 }
 
 function trimBody(body, max = 1500) {
@@ -141,11 +171,27 @@ async function draftDigest(prs) {
 
   // Anonymize each PR as "Change N" — the agent should never see PR numbers
   // or committer names, so it can't leak them into the output.
+  // Screenshots get stable global tokens ([IMG 1], [IMG 2], ...) mapped to URLs.
+  // The agent may emit those tokens (and ONLY those) to place a screenshot
+  // under the entry it belongs to; we swap them back to image markdown after.
+  const imgTokenToRef = {}; // "[IMG 3]" -> { url, caption }
+  let imgCounter = 0;
   const prSummaries = prs
     .map((pr, i) => {
       const labels = pr.labels?.length ? `\n  Labels: ${pr.labels.join(', ')}` : '';
       const files = pr.fileSummary ? `\n  Files (top dirs): ${pr.fileSummary}` : '';
-      return `Change ${i + 1}:\n  Title: ${pr.title}${labels}${files}\n  Description: ${trimBody(pr.body)}`;
+      let shots = '';
+      if (pr.screenshots?.length) {
+        const toks = pr.screenshots.map((s) => {
+          imgCounter += 1;
+          const token = `[IMG ${imgCounter}]`;
+          imgTokenToRef[token] = { url: s.url, caption: s.caption || '' };
+          const cap = s.caption ? ` — ${s.caption}` : '';
+          return `${token}${cap}`;
+        });
+        shots = `\n  Screenshots (emit the token to show one under this entry): ${toks.join('; ')}`;
+      }
+      return `Change ${i + 1}:\n  Title: ${pr.title}${labels}${files}${shots}\n  Description: ${trimBody(pr.body)}`;
     })
     .join('\n\n');
 
@@ -163,6 +209,7 @@ async function draftDigest(prs) {
 - **NEVER include** internal codenames: ARES, Triron, Gladriel, Galadriel, Normandy, Openclaw, sense_frontend, or any repository/service name. Refer to the product as "Air" only.
 - **NEVER include** pricing, dollar amounts we charge, dated roadmap commitments ("coming in October"), unreleased features that aren't beta-available, or sales/marketing spin.
 - **NEVER fabricate.** If a change's description is too thin to say something concrete and true about it, SKIP it. Silence is safer than invention.
+- **Screenshots are the ONE allowed exception** to the "no identifiers" rule: a change may list screenshot tokens like \`[IMG 3]\`. If you write up that change, you MAY place its token(s) on their OWN line directly under that entry to show the screenshot. Emit the token EXACTLY as given (e.g. \`[IMG 3]\`) and NOTHING else on that line. Only use tokens that were listed for a change you actually wrote about. NEVER invent a token, NEVER reuse a token for a different change, and NEVER emit a raw image URL. Prefer at most 1-2 screenshots per entry (the clearest ones); skip screenshots that are noisy, show only console/logs, or don't add customer value.
 
 ## Structure (this shape is non-negotiable)
 
@@ -262,6 +309,22 @@ ${prSummaries || '(no changes)'}
   const contentData = await contentRes.json();
   const content = Buffer.from(contentData.content, 'base64').toString('utf8').trim();
 
+  // Swap screenshot tokens ([IMG N]) back into image markdown. Any token the
+  // agent emitted that we don't recognize is stripped (prevents stray tokens
+  // leaking into the customer email). Captions are reused from the source PR.
+  const withImages = content.replace(/\[IMG\s*(\d+)\]/gi, (full, n) => {
+    const key = `[IMG ${n}]`;
+    const ref = imgTokenToRef[key];
+    if (!ref) {
+      console.log(`  Dropping unknown screenshot token ${full}`);
+      return '';
+    }
+    const caption = (ref.caption || '').replace(/[\[\]()]/g, '').trim();
+    return `![${caption}](${ref.url})`;
+  });
+  const imgUsed = (content.match(/\[IMG\s*\d+\]/gi) || []).length;
+  console.log(`Screenshot tokens: ${Object.keys(imgTokenToRef).length} offered, ${imgUsed} placed by agent`);
+
   // Best-effort cleanup — leave the branch behind if delete fails (nightly runs
   // would leak branches otherwise but a failed delete shouldn't fail the run).
   const delRes = await fetch(
@@ -270,7 +333,7 @@ ${prSummaries || '(no changes)'}
   ).catch((err) => ({ ok: false, statusText: err.message }));
   console.log(delRes.ok ? `Deleted branch ${actualBranch}` : `Warning: could not delete ${actualBranch} (${delRes.status || delRes.statusText})`);
 
-  return content;
+  return withImages;
 }
 
 function escapeHtml(s) {
